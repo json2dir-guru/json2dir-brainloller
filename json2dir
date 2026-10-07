@@ -1,0 +1,46 @@
+#!/bin/sh
+# The Brainloller evaluator (json2dir.png: json2dir.bf from json2dir.bfl by tools/bfl.py,
+# laid out as an image by tools/bf2loller.py) owns UTF-8 checking, JSON parsing, validation
+# and shell generation; this launcher only moves bytes and runs the generated script.
+#
+# Transport framing only: an 8-bit Brainloller cell cannot tell a NUL byte from end of input,
+# so the document is fed to the evaluator as decimal byte values (od -An -v -tu1).
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+# Any Brainloller interpreter with 8-bit wrapping cells works; the default is Brainfunk (bfk).
+if ! (
+  umask 077
+  od -An -v -tu1 < "$task_tmp/input.json" > "$task_tmp/input.dec"
+  ${JSON2DIR_BL:-bfk --lang=loller} "$script_dir/json2dir.png" < "$task_tmp/input.dec" > "$task_tmp/tree.sh"
+); then
+  exit 1
+fi
+
+# The script is only run if the evaluator wrote its end marker as the last line;
+# otherwise its last line is its error message.
+last=$(tail -n 1 "$task_tmp/tree.sh")
+if [ "$last" != '# json2dir: end' ]; then
+  case $last in
+    'json2dir: '*) printf '%s\n' "$last" >&2 ;;
+    *) printf '%s\n' 'json2dir: the evaluator did not finish' >&2 ;;
+  esac
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"

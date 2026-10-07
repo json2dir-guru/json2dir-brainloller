@@ -1,0 +1,327 @@
+# json2dir evaluator, compiled to json2dir.bf by tools/bfl.py.
+#
+# Input: the document framed by the launcher as decimal byte values separated by
+# blanks/newlines (the output of `od -An -v -tu1`); anything that is not a digit,
+# blank or newline (including the interpreter's EOF value) ends the input.
+# Output: a POSIX sh script whose last line is "# json2dir: end", or, on any
+# error, whatever was printed so far followed by "json2dir: <message>".
+#
+# The parser is one byte-driven state machine: each turn of the main loop reads
+# a byte (if the previous state consumed the last one) and runs one state.
+# Values are streamed: shell commands are printed while the document is parsed;
+# the launcher runs them only if the end marker shows the whole document passed.
+
+var ok err done want eof c d
+var need lo hi                         # UTF-8 checker
+var st ret mode depth isarr kind       # parser
+var nlen ndots kpos klink kscript tnz  # name / kind / link target checks
+var esc needlow hk hx h1 h2 h3 h4 a2 a3 a4
+var q1 q2 q3 q4 nq b n1 n2 n3 dq dr
+
+# states
+#  0 root   1 after {   2 after ,   3 after name   4 value   5 array kind
+#  6 after kind   7 array payload   8 after payload   9 after value
+# 10 trailing   11 inside a string
+# string modes: 1 name  2 file content  3 link target  4 array kind
+
+macro getb {
+  c = 0
+  d = getc
+  while d == 32 || d == 10 { d = getc }
+  if d >= 48 && d < 58 {
+    while d >= 48 && d < 58 {
+      c = c * 10 + d - 48
+      d = getc
+    }
+    utf8
+  } else {
+    eof = 1
+  }
+}
+
+macro badutf { fail "input is not valid UTF-8" }
+
+macro utf8 {
+  if need {
+    if c < lo || c > hi { badutf }
+    need -= 1
+    lo = 128
+    hi = 191
+  } elif c >= 128 {
+    if c < 194 { badutf }
+    elif c < 224 { need = 1 }
+    elif c == 224 { need = 2 lo = 160 }
+    elif c < 237 { need = 2 }
+    elif c == 237 { need = 2 hi = 159 }
+    elif c < 240 { need = 2 }
+    elif c == 240 { need = 3 lo = 144 }
+    elif c < 244 { need = 3 }
+    elif c == 244 { need = 3 hi = 143 }
+    else { badutf }
+  }
+}
+
+macro isws(f) {
+  f = 0
+  if c == 32 || c == 9 || c == 10 || c == 13 { f = 1 }
+}
+
+macro startname {
+  want = 1
+  d = '/'
+  pushpath d
+  d = 0
+  nlen = 0
+  ndots = 0
+  mode = 1
+  ret = 3
+  st = 11
+}
+
+macro closeobj {
+  want = 1
+  if depth { depth -= 1 popname st = 9 } else { st = 10 }
+}
+
+macro badarray { fail "an array must be [\"link\", target] or [\"script\", content]" }
+
+# one decoded string byte b, by mode
+macro sink {
+  if mode == 1 {
+    if b == '/' { fail "a name cannot contain /" }
+    elif b == 0 { fail "a name cannot contain NUL" }
+    else {
+      pushpath b
+      if nlen < 3 {
+        if b == '.' { ndots += 1 }
+        nlen += 1
+      }
+    }
+  } elif mode == 4 {
+    if kpos == 0 {
+      if b != 'l' { klink = 0 }
+      if b != 's' { kscript = 0 }
+    } elif kpos == 1 {
+      if b != 'i' { klink = 0 }
+      if b != 'c' { kscript = 0 }
+    } elif kpos == 2 {
+      if b != 'n' { klink = 0 }
+      if b != 'r' { kscript = 0 }
+    } elif kpos == 3 {
+      if b != 'k' { klink = 0 }
+      if b != 'i' { kscript = 0 }
+    } elif kpos == 4 {
+      klink = 0
+      if b != 'p' { kscript = 0 }
+    } elif kpos == 5 {
+      klink = 0
+      if b != 't' { kscript = 0 }
+    } else {
+      klink = 0
+      kscript = 0
+    }
+    if kpos < 7 { kpos += 1 }
+  } else {
+    tnz = 1
+    if b == 39 { print "'\\''" }
+    elif b == 0 {
+      if mode == 3 { fail "a link target cannot contain NUL" }
+      print "' '"
+    } else { putc b }
+  }
+}
+
+# the closing quote of a string, by mode
+macro endstring {
+  if needlow { fail "unpaired surrogate escape" }
+  if mode == 1 {
+    if nlen == 0 { fail "a name cannot be empty" }
+    elif nlen < 3 && ndots == nlen { fail "a name cannot be . or .." }
+  } elif mode == 4 {
+    if klink && kpos == 4 { kind = 1 }
+    elif kscript && kpos == 6 { kind = 2 }
+    else { badarray }
+  } else {
+    if mode == 3 && !tnz { fail "a link target cannot be empty" }
+    print "'\n"
+  }
+  st = ret
+}
+
+# \uXXXX has been read into h1..h4: queue its UTF-8 bytes in q1..q4
+macro unicode {
+  if needlow {
+    if h1 == 13 && h2 >= 12 {
+      # supplementary plane: A = high - 0xD800 + 64 (nibbles n1 n2 n3), low bits in h2-12 h3 h4
+      needlow = 0
+      n3 = a4
+      n2 = a3 + 4
+      n1 = a2
+      if n2 >= 16 { n2 -= 16 n1 += 1 }
+      divmod n3, 4, dq, dr
+      q1 = n1 + 240
+      q2 = n2 * 4 + dq + 128
+      n3 = dr
+      divmod h3, 4, dq, dr
+      q3 = n3 * 16 + h2 * 4 + dq + 80
+      q4 = dr * 16 + h4 + 128
+      nq = 4
+    } else { fail "unpaired surrogate escape" }
+  } elif h1 == 13 && h2 >= 8 {
+    if h2 >= 12 { fail "unpaired surrogate escape" }
+    needlow = 1
+    a2 = h2 - 8
+    a3 = h3
+    a4 = h4
+  } elif h1 == 0 && h2 == 0 && h3 < 8 {
+    q1 = h3 * 16 + h4
+    nq = 1
+  } elif h1 == 0 && h2 < 8 {
+    divmod h3, 4, dq, dr
+    q1 = h2 * 4 + dq + 192
+    q2 = dr * 16 + h4 + 128
+    nq = 2
+  } else {
+    divmod h3, 4, dq, dr
+    q1 = h1 + 224
+    q2 = h2 * 4 + dq + 128
+    q3 = dr * 16 + h4 + 128
+    nq = 3
+  }
+  n1 = 0 n2 = 0 n3 = 0 dq = 0 dr = 0
+}
+
+macro strbyte {
+  want = 1
+  if eof { fail "unterminated string" }
+  elif esc == 0 {
+    if c == '"' { endstring }
+    elif c == '\\' { esc = 1 }
+    elif needlow { fail "unpaired surrogate escape" }
+    elif c < 32 { fail "control character in string" }
+    else { q1 = c nq = 1 }
+  } elif esc == 1 {
+    esc = 0
+    if needlow && c != 'u' { fail "unpaired surrogate escape" }
+    elif c == '"' { q1 = 34 nq = 1 }
+    elif c == '\\' { q1 = 92 nq = 1 }
+    elif c == '/' { q1 = 47 nq = 1 }
+    elif c == 'b' { q1 = 8 nq = 1 }
+    elif c == 'f' { q1 = 12 nq = 1 }
+    elif c == 'n' { q1 = 10 nq = 1 }
+    elif c == 'r' { q1 = 13 nq = 1 }
+    elif c == 't' { q1 = 9 nq = 1 }
+    elif c == 'u' { esc = 2 hk = 4 }
+    else { fail "invalid escape in string" }
+  } else {
+    if c >= '0' && c <= '9' { hx = c - 48 }
+    elif c >= 'a' && c <= 'f' { hx = c - 87 }
+    elif c >= 'A' && c <= 'F' { hx = c - 55 }
+    else { fail "invalid \\u escape" }
+    h1 = h2 h2 = h3 h3 = h4 h4 = hx hx = 0
+    hk -= 1
+    if hk == 0 {
+      esc = 0
+      unicode
+    }
+  }
+  while nq && ok {
+    b = q1 q1 = q2 q2 = q3 q3 = q4 q4 = 0
+    nq -= 1
+    sink
+  }
+}
+
+# ---- main
+
+print "set -eu\n"
+print "_j2d_fail() { printf 'json2dir: cannot create %s\\n' \"$1\" >&2; exit 1; }\n"
+print "_j2d_clear() {\n"
+print "  if [ -L \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+print "  elif [ -d \"$1\" ]; then printf 'json2dir: a directory is in the way: %s\\n' \"$1\" >&2; exit 1\n"
+print "  elif [ -e \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+print "  fi\n"
+print "}\n"
+print "_j2d_dir() {\n"
+print "  if [ -L \"$1\" ] || { [ -e \"$1\" ] && [ ! -d \"$1\" ]; }; then rm -f -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+print "  if [ ! -d \"$1\" ]; then mkdir -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+print "}\n"
+print "_j2d_file() {\n"
+print "  _j2d_clear \"$1\"\n"
+print "  _j2d_path=$1; shift\n"
+print "  {\n"
+print "    printf '%s' \"$1\"; shift\n"
+print "    for _j2d_part in \"$@\"; do printf '\\000%s' \"$_j2d_part\"; done\n"
+print "  } > \"$_j2d_path\" || _j2d_fail \"$_j2d_path\"\n"
+print "}\n"
+print "_j2d_script() { _j2d_file \"$@\"; chmod a+x -- \"$1\" || _j2d_fail \"$1\"; }\n"
+print "_j2d_link() { _j2d_clear \"$1\"; ln -s -- \"$2\" \"$1\" || _j2d_fail \"$1\"; }\n"
+
+ok = 1
+want = 1
+lo = 128
+hi = 191
+
+while ok && !done {
+  if want { getb }
+  want = 0
+  if st == 11 { strbyte }
+  else {
+    isws(d)
+    if d { want = 1 }
+    elif st == 0 {
+      if c == '{' { want = 1 st = 1 }
+      else { fail "the root of the document must be an object" }
+    } elif st == 1 {
+      if c == '}' { closeobj }
+      elif c == '"' { startname }
+      else { fail "expected a name or }" }
+    } elif st == 2 {
+      if c == '"' { startname }
+      else { fail "expected a name" }
+    } elif st == 3 {
+      if c == ':' { want = 1 st = 4 }
+      else { fail "expected :" }
+    } elif st == 4 {
+      want = 1
+      if c == '"' {
+        print "_j2d_file '" printpath print "' '"
+        mode = 2 isarr = 0 ret = 8 st = 11
+      } elif c == '[' {
+        st = 5
+      } elif c == '{' {
+        print "_j2d_dir '" printpath print "'\n"
+        if depth == 250 { fail "the document is nested too deeply" }
+        depth += 1
+        st = 1
+      } else { fail "only objects, strings and [kind, payload] arrays are allowed" }
+    } elif st == 5 {
+      if c == '"' { want = 1 mode = 4 klink = 1 kscript = 1 kpos = 0 ret = 6 st = 11 }
+      else { badarray }
+    } elif st == 6 {
+      if c == ',' { want = 1 st = 7 }
+      else { badarray }
+    } elif st == 7 {
+      if c == '"' {
+        want = 1
+        if kind == 1 { print "_j2d_link '" mode = 3 } else { print "_j2d_script '" mode = 2 }
+        printpath print "' '"
+        tnz = 0 isarr = 1 ret = 8 st = 11
+      } else { badarray }
+    } elif st == 8 {
+      if isarr {
+        if c == ']' { want = 1 isarr = 0 popname st = 9 }
+        else { badarray }
+      } else { popname st = 9 }
+    } elif st == 9 {
+      if c == ',' { want = 1 st = 2 }
+      elif c == '}' { closeobj }
+      else { fail "expected , or }" }
+    } else {
+      if eof { done = 1 }
+      else { fail "trailing data after the JSON value" }
+    }
+  }
+}
+
+if ok { print "# json2dir: end\n" } else { failreport }
